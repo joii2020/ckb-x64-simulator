@@ -1,5 +1,10 @@
 pub mod constants;
 
+pub mod spawn;
+pub use spawn::*;
+
+mod utils;
+
 #[macro_use]
 extern crate lazy_static;
 
@@ -56,7 +61,7 @@ lazy_static! {
 }
 
 fn assert_vm_version() {
-    if SETUP.vm_version != 1 {
+    if SETUP.vm_version != 1 && SETUP.vm_version != 2 {
         panic!(
             "Currently running setup vm_version({}) not support this syscall",
             SETUP.vm_version
