@@ -1,4 +1,7 @@
-use crate::utils::{Event, Fd, ProcID, SimID};
+use crate::{
+    global_data::GlobalData,
+    utils::{Event, Fd, ProcID, SimID},
+};
 use std::{cell::RefCell, collections::HashMap, thread::JoinHandle};
 
 thread_local! {
@@ -8,106 +11,66 @@ thread_local! {
 
 const MAX_PROCESSES_COUNT: u64 = 16;
 
-pub struct Child {
-    id: ProcID,
-    inherited_fds: Vec<Fd>,
-
-    event_wait: Event,
-    event_notify: Event,
+#[derive(PartialEq, Eq, Debug)]
+pub enum ProcStatus {
+    Loaded,
+    // Running,
+    WaitSpawn,
+    ReadWait(Fd, usize, Vec<u8>, u64),
+    WriteWait(Fd, Vec<u8>, u64),
+    Terminated,
+}
+impl Default for ProcStatus {
+    fn default() -> Self {
+        Self::Loaded
+    }
+}
+impl ProcStatus {
+    fn read_wait(&self) -> Option<(&Fd, &usize, &[u8])> {
+        if let Self::ReadWait(fd, len, buf, _) = self {
+            Some((fd, len, buf))
+        } else {
+            None
+        }
+    }
+    fn read_wait_mut(&mut self) -> Option<(&mut Fd, &mut usize, &mut Vec<u8>)> {
+        if let Self::ReadWait(fd, len, buf, _) = self {
+            Some((fd, len, buf))
+        } else {
+            None
+        }
+    }
+    fn write_wait(&self) -> Option<(&Fd, &[u8])> {
+        if let Self::WriteWait(fd, buf, _) = self {
+            Some((fd, buf))
+        } else {
+            None
+        }
+    }
+    fn write_wait_mut(&mut self) -> Option<(&mut Fd, &mut Vec<u8>)> {
+        if let Self::WriteWait(fd, buf, _) = self {
+            Some((fd, buf))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
-pub struct ProcInfo {
-    id: ProcID,
+struct ProcInfo {
+    parent_id: ProcID,
 
     inherited_fds: Vec<Fd>,
-    event_wait: Event,
-    event_notify: Event,
 
-    children: HashMap<ProcID, Child>, // wait, notify
-
+    scheduler_event: Event,
     join_handle: Option<JoinHandle<i8>>,
-    wait_exit: bool,
 }
 impl ProcInfo {
-    pub fn set_ctx_id(id: ProcID) {
+    fn set_pid(id: ProcID) {
         PROC_CONTEXT_ID.with(|f| *f.borrow_mut() = id);
     }
-    pub fn ctx_id() -> ProcID {
+    pub fn id() -> ProcID {
         PROC_CONTEXT_ID.with(|f| f.borrow().clone())
-    }
-
-    pub fn inherited_fds(&self) -> Vec<Fd> {
-        self.inherited_fds.clone()
-    }
-
-    fn get_child_by_fd(&self, fd: &Fd) -> Option<&Child> {
-        if let Some((_, child)) = self
-            .children
-            .iter()
-            .find(|(_id, child)| child.inherited_fds.iter().any(|f| f == fd))
-        {
-            Some(child)
-        } else {
-            None
-        }
-    }
-
-    fn get_child_by_id(&self, id: &ProcID) -> Option<&Child> {
-        if let Some((_, c)) = self.children.iter().find(|(_, child)| &child.id == id) {
-            Some(c)
-        } else {
-            None
-        }
-    }
-
-    pub fn wait(&self, fd: Option<&Fd>) -> Event {
-        if let Some(fd) = fd {
-            if self.inherited_fds.iter().any(|f| f == fd) {
-                self.event_wait.clone()
-            } else if let Some(child) = self.get_child_by_fd(&fd.other_fd()) {
-                child.event_wait.clone()
-            } else {
-                panic!("wait unknow fd {:?}", fd);
-            }
-        } else {
-            self.event_wait.clone()
-        }
-    }
-    pub fn notify(&self, fd: Option<&Fd>) {
-        if let Some(fd) = fd {
-            if self.inherited_fds.iter().any(|f| f == fd) {
-                self.event_notify.notify();
-            } else if let Some(child) = self.get_child_by_fd(&fd.other_fd()) {
-                child.event_notify.notify();
-            } else {
-                panic!("notify unknow fd {:?}", fd);
-            }
-        } else {
-            self.event_notify.notify();
-        }
-    }
-
-    pub fn get_event_by_pid(&self, id: &ProcID) -> Event {
-        if id == &self.id {
-            self.event_wait.clone()
-        } else if let Some(c) = self.get_child_by_id(id) {
-            c.event_wait.clone()
-        } else {
-            panic!("notify unknow pid {:?}", id);
-        }
-    }
-
-    pub fn set_join(&mut self, j: JoinHandle<i8>) {
-        self.join_handle = Some(j);
-    }
-
-    pub fn wait_exit(&mut self) -> Option<JoinHandle<i8>> {
-        self.event_notify.notify();
-        self.event_wait.notify();
-        self.wait_exit = true;
-
-        self.join_handle.take()
     }
 }
 
@@ -116,25 +79,32 @@ pub struct SimContext {
     proc_id_count: ProcID,
 
     proc_info: HashMap<ProcID, ProcInfo>,
+    process_status: HashMap<ProcID, ProcStatus>,
 
     fds: HashMap<Fd, ProcID>,
-    bufs: HashMap<Fd, Vec<u8>>,
+
+    dbg_status_count: u64,
 }
 impl Default for SimContext {
     fn default() -> Self {
-        ProcInfo::set_ctx_id(0.into());
+        ProcInfo::set_pid(0.into());
         Self {
             fds_count: 2,
             proc_id_count: 1.into(),
             proc_info: [(0.into(), ProcInfo::default())].into(),
+            process_status: Default::default(),
             fds: Default::default(),
-            bufs: Default::default(),
+
+            dbg_status_count: 0,
         }
     }
 }
 impl SimContext {
-    pub fn set_ctx_id(id: SimID) {
+    pub fn update_ctx_id(id: SimID, pid: Option<ProcID>) {
         TX_CONTEXT_ID.with(|f| *f.borrow_mut() = id);
+        if let Some(pid) = pid {
+            ProcInfo::set_pid(pid);
+        }
     }
     pub fn ctx_id() -> SimID {
         TX_CONTEXT_ID.with(|f| f.borrow().clone())
@@ -144,51 +114,58 @@ impl SimContext {
         PROC_CONTEXT_ID.with(|f| *f.borrow_mut() = 0.into());
     }
 
-    pub fn new_process(&mut self, parent_id: Option<ProcID>, fds: &[Fd]) -> ProcID {
+    pub fn start_process<F: Send + 'static + FnOnce(SimID, ProcID) -> i8>(
+        &mut self,
+        fds: &[Fd],
+        func: F,
+    ) -> ProcID {
+        let parent_id = ProcInfo::id();
         let id = self.proc_id_count.next();
-        let (e_wait, e_notify) = if parent_id.is_some() {
-            let p = self
-                .proc_info
-                .get_mut(parent_id.as_ref().unwrap())
-                .unwrap_or_else(|| panic!("unknow pid: {:?}", parent_id));
-            let e_wait = Event::default();
-            let e_notify = Event::default();
-
-            p.children.insert(
-                id.clone(),
-                Child {
-                    id: id.clone(),
-                    event_wait: e_wait.clone(),
-                    event_notify: e_notify.clone(),
-                    inherited_fds: fds.to_vec(),
-                },
-            );
-            (e_wait, e_notify)
-        } else {
-            // TODO
-            (Event::default(), Event::default())
-        };
-
-        let proc = ProcInfo {
-            id: id.clone(),
+        let process = ProcInfo {
+            parent_id: parent_id.clone(),
             inherited_fds: fds.to_vec(),
-            event_notify: e_wait,
-            event_wait: e_notify,
-            children: Default::default(),
-            join_handle: None,
-            wait_exit: false,
+            ..Default::default()
         };
 
-        self.proc_info.insert(id.clone(), proc);
+        self.proc_info.insert(id.clone(), process);
+        let ctx_id = SimContext::ctx_id();
 
-        id
+        fds.iter().all(|fd| {
+            self.move_pipe(fd, id.clone());
+            true
+        });
+        self.process_status.insert(parent_id, ProcStatus::WaitSpawn);
+
+        let id2 = id.clone();
+        let join_handle = std::thread::spawn(move || {
+            SimContext::update_ctx_id(ctx_id.clone(), Some(id.clone()));
+            let code = func(ctx_id.clone(), id.clone());
+
+            let mut gd = GlobalData::locked();
+            let cur_sim = gd.get_tx_mut(&SimContext::ctx_id());
+            cur_sim.close_all(&id);
+            cur_sim.process_io();
+
+            code
+        });
+
+        self.process_mut(&id2).join_handle = Some(join_handle);
+
+        id2
     }
-    pub fn proc_info(&self, id: &ProcID) -> &ProcInfo {
+    pub fn pid() -> ProcID {
+        ProcInfo::id()
+    }
+    pub fn inherited_fds(&self) -> Vec<Fd> {
+        let process = self.process(&ProcInfo::id());
+        process.inherited_fds.clone()
+    }
+    fn process(&self, id: &ProcID) -> &ProcInfo {
         self.proc_info
             .get(id)
             .unwrap_or_else(|| panic!("unknow process id: {:?}", id))
     }
-    pub fn proc_mut_info(&mut self, id: &ProcID) -> &mut ProcInfo {
+    fn process_mut(&mut self, id: &ProcID) -> &mut ProcInfo {
         self.proc_info
             .get_mut(id)
             .unwrap_or_else(|| panic!("unknow process id: {:?}", id))
@@ -199,9 +176,179 @@ impl SimContext {
     pub fn has_proc(&self, id: &ProcID) -> bool {
         self.proc_info.contains_key(id)
     }
+    pub fn get_event(&self) -> Event {
+        self.process(&ProcInfo::id()).scheduler_event.clone()
+    }
+    pub fn exit(&mut self, id: &ProcID) -> Option<JoinHandle<i8>> {
+        let process = self.process_mut(id);
+
+        process.join_handle.take()
+    }
+
+    fn process_io(&mut self) {
+        if let Some(id) = self
+            .process_status
+            .iter()
+            .find(|(_pid, status)| status == &&ProcStatus::Terminated)
+            .map(|(id, _)| id.clone())
+        {
+            let p = &self.process(&id).parent_id;
+            self.process(p).scheduler_event.notify();
+
+            self.process_status.remove(&id);
+            return;
+        }
+        if let Some(it) = self
+            .process_status
+            .iter()
+            .find(|(_, status)| {
+                if let Some((_fd, buf)) = status.write_wait() {
+                    buf.is_empty()
+                } else {
+                    false
+                }
+            })
+            .map(|f| f.0.clone())
+        {
+            self.process(&it).scheduler_event.notify();
+            self.process_status.remove(&it);
+            return;
+        }
+
+        let mut update_fds = Vec::new();
+        self.process_status.iter().all(|(pid, status)| {
+            if let Some((rfd, _len, _buf)) = status.read_wait() {
+                let write_fd = rfd.other_fd();
+                if let Some(w_pid) = self.fds.get(&write_fd) {
+                    if let Some((w_fd, w_buf)) =
+                        self.process_status.get(w_pid).and_then(|f| f.write_wait())
+                    {
+                        update_fds
+                            .push((pid.clone(), (w_pid.clone(), w_fd.clone(), w_buf.to_vec())));
+                    }
+                }
+            }
+            true
+        });
+        if update_fds.iter().any(|(r_pid, (w_pid, _wfd, wbuf))| {
+            let (_rfd, rlen, rbuf) = self
+                .process_status
+                .get_mut(r_pid)
+                .and_then(|status| status.read_wait_mut())
+                .unwrap();
+
+            let copy_len = (*rlen).min(wbuf.len());
+            rbuf.extend_from_slice(&wbuf[..copy_len]);
+            *rlen -= copy_len;
+            let rlen = rlen.clone();
+
+            let (_, wbuf) = self
+                .process_status
+                .get_mut(w_pid)
+                .and_then(|status| status.write_wait_mut())
+                .unwrap();
+
+            *wbuf = wbuf[copy_len..].to_vec();
+            if rlen == 0 {
+                self.process(r_pid).scheduler_event.notify();
+                true
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
+
+        if let Some(it) = self
+            .process_status
+            .iter()
+            .find(|(_, status)| {
+                if let Some((_fd, buf)) = status.write_wait() {
+                    buf.is_empty()
+                } else {
+                    false
+                }
+            })
+            .map(|f| f.0.clone())
+        {
+            self.process(&it).scheduler_event.notify();
+            self.process_status.remove(&it);
+            return;
+        }
+        if let Some(it) = self
+            .process_status
+            .iter()
+            .find(|(_, status)| {
+                if let Some((_, r_len, _r_buf)) = status.read_wait() {
+                    r_len == &0
+                } else {
+                    false
+                }
+            })
+            .map(|f| f.0)
+        {
+            self.process(it).scheduler_event.notify();
+            return;
+        }
+        if let Some(id) = self
+            .process_status
+            .iter()
+            .find(|(_, status)| *status == &ProcStatus::WaitSpawn)
+            .map(|f| f.0)
+        {
+            self.process(id).scheduler_event.notify();
+        }
+    }
+    pub fn wait_read(&mut self, fd: Fd, len: usize) -> Event {
+        let id = ProcInfo::id();
+        let dbg_id = self.dbg_status_count;
+        self.dbg_status_count += 1;
+
+        self.process_status
+            .insert(id, ProcStatus::ReadWait(fd, len, Vec::new(), dbg_id));
+
+        println!("==wait read1 status: {:?}", self.process_status);
+        self.process_io();
+        println!("==wait read2 status: {:?}", self.process_status);
+        self.get_event()
+    }
+    pub fn wait_write(&mut self, fd: Fd, buf: &[u8]) -> Event {
+        let id = ProcInfo::id();
+        let dbg_id = self.dbg_status_count;
+        self.dbg_status_count += 1;
+
+        self.process_status
+            .insert(id, ProcStatus::WriteWait(fd, buf.to_vec(), dbg_id));
+
+        println!("==wait write1 status: {:?}", self.process_status);
+        self.process_io();
+        println!("==wait write2 status: {:?}", self.process_status);
+
+        self.get_event()
+    }
+    pub fn read_cache(&mut self, fd: &Fd) -> Vec<u8> {
+        let mut ref_buf = Vec::new();
+        if let Some((pid, buf)) = self
+            .process_status
+            .iter()
+            .find(|(_, status)| {
+                if let Some((rfd, _, _buf)) = status.read_wait() {
+                    fd == rfd
+                } else {
+                    false
+                }
+            })
+            .and_then(|f| f.1.read_wait().map(|p| (f.0.clone(), p.2.to_vec())))
+        {
+            ref_buf = buf.to_vec();
+            self.process_status.remove(&pid);
+        }
+
+        ref_buf
+    }
 
     pub fn new_pipe(&mut self) -> (Fd, Fd) {
-        let pid = ProcInfo::ctx_id();
+        let pid = ProcInfo::id();
         let fds = Fd::create(self.fds_count);
 
         self.fds.insert(fds.0.clone(), pid.clone());
@@ -220,14 +367,14 @@ impl SimContext {
     pub fn len_pipe(&self) -> usize {
         self.fds.len()
     }
-    pub fn move_pipe(&mut self, fd: &Fd, pid: ProcID) {
+    fn move_pipe(&mut self, fd: &Fd, pid: ProcID) {
         let f = self
             .fds
             .get_mut(fd)
             .unwrap_or_else(|| panic!("unknow fd: {:?}", fd));
         *f = pid;
     }
-    pub fn close_all(&mut self, id: &ProcID) {
+    fn close_all(&mut self, id: &ProcID) {
         let keys_to_rm: Vec<Fd> = self
             .fds
             .iter()
@@ -237,42 +384,19 @@ impl SimContext {
         for k in keys_to_rm {
             self.fds.remove(&k);
         }
+
+        self.process_status
+            .insert(id.clone(), ProcStatus::Terminated);
     }
 
     pub fn has_fd(&self, fd: &Fd) -> bool {
         if let Some(pid) = self.fds.get(fd) {
-            &ProcInfo::ctx_id() == pid
+            &ProcInfo::id() == pid
         } else {
             false
         }
     }
     pub fn chech_other_fd(&self, fd: &Fd) -> bool {
         self.fds.contains_key(&fd.other_fd())
-    }
-
-    pub fn read_data(&mut self, fd: &Fd, len: usize) -> (Vec<u8>, usize) {
-        let data = self.bufs.get(fd);
-        if data.is_none() {
-            return (Vec::new(), 0);
-        }
-        let data = data.unwrap().clone();
-
-        if len >= data.len() {
-            self.bufs.remove(fd);
-            (data, 0)
-        } else {
-            *self.bufs.get_mut(fd).unwrap() = data[len..].to_vec();
-            (data[..len].to_vec(), data.len() - len)
-        }
-    }
-    pub fn write_data(&mut self, fd: &Fd, buf: &[u8]) {
-        if let Some(bufs) = self.bufs.get_mut(&fd.other_fd()) {
-            bufs.extend_from_slice(buf);
-        } else {
-            self.bufs.insert(fd.other_fd(), buf.to_vec());
-        }
-    }
-    pub fn has_data(&self, fd: &Fd) -> bool {
-        self.bufs.contains_key(fd) || self.bufs.contains_key(&fd.other_fd())
     }
 }
